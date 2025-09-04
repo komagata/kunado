@@ -24,7 +24,11 @@ Rails development gateway that enables HTTPS access to multiple Rails apps via `
 ### macOS (Homebrew)
 
 ```bash
-brew install kunado
+# Direct install from GitHub
+brew install https://raw.githubusercontent.com/komagata/kunado/main/Formula/kunado.rb
+
+# Update
+brew upgrade kunado
 ```
 
 #### Auto-start on macOS
