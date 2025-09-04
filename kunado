@@ -159,10 +159,32 @@ class Kunado
     # Generate CA private key
     system("openssl genrsa -out #{key_path} 4096 2>/dev/null") or raise "Failed to generate CA key"
     
-    # Generate CA certificate
-    subject = "/C=JP/O=Kunado/CN=Kunado Local CA"
-    system("openssl req -new -x509 -days 3650 -key #{key_path} -out #{cert_path} -subj '#{subject}'") or 
+    # Create CA certificate with proper extensions
+    ca_config = Tempfile.new(['ca', '.conf'])
+    ca_config.write(<<~CONFIG)
+      [req]
+      distinguished_name = req_distinguished_name
+      x509_extensions = v3_ca
+      prompt = no
+      
+      [req_distinguished_name]
+      C = JP
+      O = Kunado
+      CN = Kunado Local CA
+      
+      [v3_ca]
+      subjectKeyIdentifier = hash
+      authorityKeyIdentifier = keyid:always,issuer
+      basicConstraints = critical, CA:true
+      keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+    CONFIG
+    ca_config.close
+    
+    # Generate CA certificate with extensions
+    system("openssl req -new -x509 -days 3650 -key #{key_path} -out #{cert_path} -config #{ca_config.path}") or 
       raise "Failed to generate CA certificate"
+  ensure
+    ca_config&.unlink
   end
 
   def cert_trust
@@ -389,7 +411,6 @@ class Kunado
       [alt_names]
       DNS.1 = localhost
       DNS.2 = *.localhost
-      DNS.3 = *.*.localhost
       
       [v3_ca]
       subjectAltName = @alt_names
