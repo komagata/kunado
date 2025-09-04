@@ -24,8 +24,9 @@ Rails development gateway that enables HTTPS access to multiple Rails apps via `
 ### macOS (Homebrew)
 
 ```bash
-# Direct install from GitHub
-brew install https://raw.githubusercontent.com/komagata/kunado/main/Formula/kunado.rb
+# Install via tap
+brew tap komagata/kunado
+brew install kunado
 
 # Update
 brew upgrade kunado
@@ -56,11 +57,14 @@ curl -fsSL https://raw.githubusercontent.com/komagata/kunado/main/install.sh | s
 
 1. **Initial Setup**
 ```bash
-# macOS with auto-start
+# Start the proxy (macOS with auto-start)
 brew services start kunado
 
 # OR manually start the proxy
 kunado proxy up
+
+# Trust the certificate (eliminates HTTPS warnings)
+kunado cert trust
 
 # Add hook to shell configuration
 echo 'eval "$(kunado hook)"' >> ~/.zshrc  # or ~/.bashrc
@@ -77,13 +81,22 @@ kunado open         # Open https://my-rails-app.localhost
 
 ## Commands
 
+### Proxy Management
 - `kunado proxy up` - Start the proxy server
 - `kunado proxy down` - Stop the proxy server
 - `kunado proxy status` - Show proxy status
+
+### Certificate Management
+- `kunado cert trust` - Install CA certificate to system (eliminates HTTPS warnings)
+- `kunado cert info` - Show certificate information and trust status
+
+### App Management
 - `kunado add` - Register current directory as an app
 - `kunado delete` - Remove current app from registry
 - `kunado list` - List all registered apps
 - `kunado open` - Open current app in browser
+
+### Utilities
 - `kunado hook` - Print environment variables for current app
 - `kunado version` - Show version
 - `kunado help` - Show help
