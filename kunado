@@ -159,32 +159,10 @@ class Kunado
     # Generate CA private key
     system("openssl genrsa -out #{key_path} 4096 2>/dev/null") or raise "Failed to generate CA key"
     
-    # Create CA certificate with proper extensions
-    ca_config = Tempfile.new(['ca', '.conf'])
-    ca_config.write(<<~CONFIG)
-      [req]
-      distinguished_name = req_distinguished_name
-      x509_extensions = v3_ca
-      prompt = no
-      
-      [req_distinguished_name]
-      C = JP
-      O = Kunado
-      CN = Kunado Local CA
-      
-      [v3_ca]
-      subjectKeyIdentifier = hash
-      authorityKeyIdentifier = keyid:always,issuer
-      basicConstraints = critical, CA:true
-      keyUsage = critical, digitalSignature, cRLSign, keyCertSign
-    CONFIG
-    ca_config.close
-    
-    # Generate CA certificate with extensions
-    system("openssl req -new -x509 -days 3650 -key #{key_path} -out #{cert_path} -config #{ca_config.path}") or 
+    # Generate CA certificate
+    subject = "/C=JP/O=Kunado/CN=Kunado Local CA"
+    system("openssl req -new -x509 -days 3650 -key #{key_path} -out #{cert_path} -subj '#{subject}'") or 
       raise "Failed to generate CA certificate"
-  ensure
-    ca_config&.unlink
   end
 
   def cert_trust
@@ -388,6 +366,66 @@ class Kunado
     end
   end
 
+  def add_hostname_to_cert(hostname)
+    cert_path = File.join(CERTS_DIR, 'localhost.crt')
+    
+    # Check if certificate already contains this hostname
+    cert_text = `openssl x509 -in #{cert_path} -text -noout 2>/dev/null`
+    return if cert_text.include?(hostname)
+    
+    # Regenerate certificate with additional hostname
+    puts "Adding #{hostname} to certificate..."
+    regenerate_wildcard_cert_with_hostname(hostname)
+  end
+
+  def regenerate_wildcard_cert_with_hostname(additional_hostname)
+    ca_key = File.join(CERTS_DIR, 'ca.key')
+    ca_cert = File.join(CERTS_DIR, 'ca.crt')
+    key_path = File.join(CERTS_DIR, 'localhost.key')
+    cert_path = File.join(CERTS_DIR, 'localhost.crt')
+
+    # Create config with additional hostname
+    config = Tempfile.new(['openssl', '.conf'])
+    config.write(<<~CONFIG)
+      [req]
+      distinguished_name = req_distinguished_name
+      req_extensions = v3_req
+      prompt = no
+      
+      [req_distinguished_name]
+      CN = *.localhost
+      
+      [v3_req]
+      basicConstraints = CA:FALSE
+      keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+      subjectAltName = @alt_names
+      
+      [alt_names]
+      DNS.1 = localhost
+      DNS.2 = *.localhost
+      DNS.3 = #{additional_hostname}
+      
+      [v3_ca]
+      subjectAltName = @alt_names
+      basicConstraints = CA:FALSE
+      keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+    CONFIG
+    config.close
+    
+    # Generate certificate request
+    csr = Tempfile.new(['req', '.csr'])
+    system("openssl req -new -key #{key_path} -out #{csr.path} -config #{config.path}") or
+      raise "Failed to generate certificate request"
+    
+    # Sign the certificate with our CA
+    system("openssl x509 -req -in #{csr.path} -CA #{ca_cert} -CAkey #{ca_key} -CAcreateserial " +
+           "-out #{cert_path} -days 825 -extensions v3_ca -extfile #{config.path}") or
+      raise "Failed to sign certificate"
+  ensure
+    config&.unlink
+    csr&.unlink
+  end
+
   def create_wildcard_cert(ca_key, ca_cert, key_path, cert_path)
     # Generate private key for wildcard certificate
     system("openssl genrsa -out #{key_path} 2048 2>/dev/null") or raise "Failed to generate wildcard key"
@@ -411,6 +449,7 @@ class Kunado
       [alt_names]
       DNS.1 = localhost
       DNS.2 = *.localhost
+      DNS.3 = *.*.localhost
       
       [v3_ca]
       subjectAltName = @alt_names
@@ -494,6 +533,9 @@ class Kunado
     app_name = File.basename(Dir.pwd)
     app_host = "#{app_name}.localhost"
     port = calculate_port(app_name)
+    
+    # Add this hostname to certificate if not already present
+    add_hostname_to_cert(app_host)
     
     # Load registry
     registry = load_registry
