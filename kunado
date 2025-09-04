@@ -299,47 +299,70 @@ class Kunado
   end
 
   def trust_ca(cert_path)
+    # Check if certificate is already trusted
+    if certificate_trusted?
+      return true
+    end
+    
     if RUBY_PLATFORM =~ /darwin/
-      puts "\n🔐 Certificate Trust Setup"
-      puts "=" * 50
-      puts "Kunado needs to add its CA certificate to your system keychain."
-      puts "This requires administrator privileges."
-      puts ""
-      puts "You'll be prompted for your password."
-      puts "=" * 50
-      puts ""
+      puts "\n🔐 Installing certificate (requires password)..."
       
-      # Try using security command with sudo
-      success = system("sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path}")
+      # First attempt - direct sudo
+      success = system("sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path} 2>/dev/null")
+      
+      if !success && $?.exitstatus == 1
+        # Second attempt - with osascript for GUI sudo prompt
+        script = <<~APPLESCRIPT
+          do shell script "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path}" with administrator privileges
+        APPLESCRIPT
+        
+        success = system("osascript -e '#{script.gsub("'", "\\'").gsub("\n", " ")}' >/dev/null 2>&1")
+      end
       
       if success
-        puts "✅ Certificate successfully added to keychain!"
+        puts "✅ Certificate installed successfully!"
+        return true
       else
-        puts "\n⚠️  Automatic certificate installation failed."
-        puts "Please run the following command manually:"
-        puts ""
-        puts "  kunado cert trust"
-        puts ""
-        puts "Or add the certificate manually:"
-        puts "  1. Open Keychain Access"
-        puts "  2. Drag #{cert_path} into System keychain"
-        puts "  3. Double-click the certificate and set to 'Always Trust'"
+        puts "⚠️  Certificate installation requires administrator access."
+        puts "Please enter your password when prompted:"
+        success = system("sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path}")
+        
+        if success
+          puts "✅ Certificate installed successfully!"
+          return true
+        else
+          puts "\n❌ Could not install certificate automatically."
+          puts "Please run manually: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path}"
+          return false
+        end
       end
     elsif RUBY_PLATFORM =~ /linux/
       cert_dir = '/usr/local/share/ca-certificates'
       if File.directory?(cert_dir)
-        puts "Adding certificate to Linux trust store (requires password)..."
+        puts "Installing certificate (requires password)..."
         success = system("sudo cp #{cert_path} #{cert_dir}/kunado-ca.crt") &&
                   system("sudo update-ca-certificates")
         
         if success
-          puts "✅ Certificate successfully added to trust store!"
+          puts "✅ Certificate installed successfully!"
+          return true
         else
-          puts "\n⚠️  Please run: kunado cert trust"
+          puts "⚠️  Please run: sudo kunado cert trust"
+          return false
         end
       else
-        puts "Warning: Could not find certificate directory. Please trust the CA certificate manually: #{cert_path}"
+        puts "Warning: Could not find certificate directory."
+        return false
       end
+    end
+  end
+  
+  def certificate_trusted?
+    if RUBY_PLATFORM =~ /darwin/
+      system("security find-certificate -c 'Kunado Local CA' /Library/Keychains/System.keychain >/dev/null 2>&1")
+    else
+      File.exist?('/usr/local/share/ca-certificates/kunado-ca.crt') ||
+      File.exist?('/etc/pki/ca-trust/source/anchors/kunado-ca.crt')
     end
   end
 
