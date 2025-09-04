@@ -370,32 +370,42 @@ class Kunado
     # Generate private key for wildcard certificate
     system("openssl genrsa -out #{key_path} 2048 2>/dev/null") or raise "Failed to generate wildcard key"
     
-    # Create config for certificate request
+    # Create config for certificate with proper v3 extensions
     config = Tempfile.new(['openssl', '.conf'])
     config.write(<<~CONFIG)
       [req]
       distinguished_name = req_distinguished_name
       req_extensions = v3_req
+      prompt = no
       
       [req_distinguished_name]
+      CN = *.localhost
       
       [v3_req]
+      basicConstraints = CA:FALSE
+      keyUsage = nonRepudiation, digitalSignature, keyEncipherment
       subjectAltName = @alt_names
       
       [alt_names]
-      DNS.1 = *.localhost
-      DNS.2 = localhost
+      DNS.1 = localhost
+      DNS.2 = *.localhost
+      DNS.3 = *.*.localhost
+      
+      [v3_ca]
+      subjectAltName = @alt_names
+      basicConstraints = CA:FALSE
+      keyUsage = nonRepudiation, digitalSignature, keyEncipherment
     CONFIG
     config.close
     
     # Generate certificate request
     csr = Tempfile.new(['req', '.csr'])
-    system("openssl req -new -key #{key_path} -out #{csr.path} -config #{config.path} -subj '/CN=*.localhost'") or
+    system("openssl req -new -key #{key_path} -out #{csr.path} -config #{config.path}") or
       raise "Failed to generate certificate request"
     
-    # Sign the certificate with our CA
+    # Sign the certificate with our CA - use v3_ca extensions
     system("openssl x509 -req -in #{csr.path} -CA #{ca_cert} -CAkey #{ca_key} -CAcreateserial " +
-           "-out #{cert_path} -days 365 -extensions v3_req -extfile #{config.path}") or
+           "-out #{cert_path} -days 825 -extensions v3_ca -extfile #{config.path}") or
       raise "Failed to sign certificate"
   ensure
     config&.unlink
