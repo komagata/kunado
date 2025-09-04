@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local kunado files (for development)
+.kunado/
+
+# Temporary files
+*.tmp
+tmp/

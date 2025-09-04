@@ -1,0 +1,449 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'json'
+require 'fileutils'
+require 'digest'
+require 'open3'
+require 'erb'
+require 'tempfile'
+require 'optparse'
+
+class Kunado
+  VERSION = '0.1.0'
+  KUNADO_DIR = File.expand_path('~/.kunado')
+  ROUTES_DIR = File.join(KUNADO_DIR, 'routes')
+  CERTS_DIR = File.join(KUNADO_DIR, 'certs')
+  REGISTRY_FILE = File.join(KUNADO_DIR, 'registry.json')
+  TRAEFIK_IMAGE = 'traefik:v3.1'
+  CONTAINER_NAME = 'kunado-proxy'
+  
+  def initialize
+    ensure_directories
+  end
+
+  def run(args)
+    command = args.shift
+    
+    case command
+    when 'proxy'
+      proxy_command(args)
+    when 'add'
+      add_app
+    when 'delete'
+      delete_app
+    when 'list'
+      list_apps
+    when 'open'
+      open_app
+    when 'hook'
+      print_hook
+    when 'version', '--version', '-v'
+      puts "kunado #{VERSION}"
+    when 'help', '--help', '-h', nil
+      print_help
+    else
+      puts "Unknown command: #{command}"
+      print_help
+      exit 1
+    end
+  rescue StandardError => e
+    puts "Error: #{e.message}"
+    exit 1
+  end
+
+  private
+
+  def ensure_directories
+    FileUtils.mkdir_p(KUNADO_DIR)
+    FileUtils.mkdir_p(ROUTES_DIR)
+    FileUtils.mkdir_p(CERTS_DIR)
+    
+    unless File.exist?(REGISTRY_FILE)
+      File.write(REGISTRY_FILE, '{}')
+    end
+  end
+
+  def proxy_command(args)
+    subcommand = args.shift
+    
+    case subcommand
+    when 'up'
+      proxy_up
+    when 'down'
+      proxy_down
+    when 'status'
+      proxy_status
+    else
+      puts "Unknown proxy command: #{subcommand}"
+      puts "Usage: kunado proxy [up|down|status]"
+      exit 1
+    end
+  end
+
+  def proxy_up
+    if container_running?
+      puts "Proxy is already running"
+      return
+    end
+
+    ensure_certificates
+    start_traefik
+    puts "Proxy started successfully"
+    puts "Access your apps at https://{app}.localhost"
+    
+    # Keep the process alive if started as a service
+    if ENV['KUNADO_SERVICE'] == 'true'
+      trap('TERM') { proxy_down; exit }
+      trap('INT')  { proxy_down; exit }
+      loop { sleep 60 }
+    end
+  end
+
+  def proxy_down
+    unless container_exists?
+      puts "Proxy is not running"
+      return
+    end
+
+    stop_traefik
+    puts "Proxy stopped"
+  end
+
+  def proxy_status
+    if container_running?
+      puts "Proxy is running"
+    else
+      puts "Proxy is not running"
+    end
+  end
+
+  def ensure_certificates
+    ca_key = File.join(CERTS_DIR, 'ca.key')
+    ca_cert = File.join(CERTS_DIR, 'ca.crt')
+    wildcard_key = File.join(CERTS_DIR, 'localhost.key')
+    wildcard_cert = File.join(CERTS_DIR, 'localhost.crt')
+
+    unless File.exist?(ca_key) && File.exist?(ca_cert)
+      puts "Creating local CA..."
+      create_ca(ca_key, ca_cert)
+      trust_ca(ca_cert)
+    end
+
+    unless File.exist?(wildcard_key) && File.exist?(wildcard_cert)
+      puts "Creating wildcard certificate..."
+      create_wildcard_cert(ca_key, ca_cert, wildcard_key, wildcard_cert)
+    end
+
+    File.chmod(0600, ca_key, wildcard_key)
+  end
+
+  def create_ca(key_path, cert_path)
+    # Generate CA private key
+    system("openssl genrsa -out #{key_path} 4096 2>/dev/null") or raise "Failed to generate CA key"
+    
+    # Generate CA certificate
+    subject = "/C=JP/O=Kunado/CN=Kunado Local CA"
+    system("openssl req -new -x509 -days 3650 -key #{key_path} -out #{cert_path} -subj '#{subject}'") or 
+      raise "Failed to generate CA certificate"
+  end
+
+  def trust_ca(cert_path)
+    if RUBY_PLATFORM =~ /darwin/
+      puts "Adding certificate to macOS keychain (requires password)..."
+      system("sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain #{cert_path}") or
+        puts "Warning: Failed to add certificate to keychain. You may need to trust it manually."
+    elsif RUBY_PLATFORM =~ /linux/
+      cert_dir = '/usr/local/share/ca-certificates'
+      if File.directory?(cert_dir)
+        puts "Adding certificate to Linux trust store (requires password)..."
+        system("sudo cp #{cert_path} #{cert_dir}/kunado-ca.crt") and
+        system("sudo update-ca-certificates") or
+          puts "Warning: Failed to add certificate to trust store. You may need to trust it manually."
+      else
+        puts "Warning: Could not find certificate directory. Please trust the CA certificate manually: #{cert_path}"
+      end
+    end
+  end
+
+  def create_wildcard_cert(ca_key, ca_cert, key_path, cert_path)
+    # Generate private key for wildcard certificate
+    system("openssl genrsa -out #{key_path} 2048 2>/dev/null") or raise "Failed to generate wildcard key"
+    
+    # Create config for certificate request
+    config = Tempfile.new(['openssl', '.conf'])
+    config.write(<<~CONFIG)
+      [req]
+      distinguished_name = req_distinguished_name
+      req_extensions = v3_req
+      
+      [req_distinguished_name]
+      
+      [v3_req]
+      subjectAltName = @alt_names
+      
+      [alt_names]
+      DNS.1 = *.localhost
+      DNS.2 = localhost
+    CONFIG
+    config.close
+    
+    # Generate certificate request
+    csr = Tempfile.new(['req', '.csr'])
+    system("openssl req -new -key #{key_path} -out #{csr.path} -config #{config.path} -subj '/CN=*.localhost'") or
+      raise "Failed to generate certificate request"
+    
+    # Sign the certificate with our CA
+    system("openssl x509 -req -in #{csr.path} -CA #{ca_cert} -CAkey #{ca_key} -CAcreateserial " +
+           "-out #{cert_path} -days 365 -extensions v3_req -extfile #{config.path}") or
+      raise "Failed to sign certificate"
+  ensure
+    config&.unlink
+    csr&.unlink
+  end
+
+  def start_traefik
+    # Create Traefik configuration
+    traefik_config = File.join(KUNADO_DIR, 'traefik.yml')
+    File.write(traefik_config, <<~YAML)
+      api:
+        dashboard: false
+      
+      entryPoints:
+        web:
+          address: ":80"
+          http:
+            redirections:
+              entryPoint:
+                to: websecure
+                scheme: https
+        websecure:
+          address: ":443"
+      
+      providers:
+        file:
+          directory: /routes
+          watch: true
+      
+      log:
+        level: ERROR
+    YAML
+
+    # Start Traefik container
+    cmd = [
+      'docker', 'run', '-d',
+      '--name', CONTAINER_NAME,
+      '--restart', 'unless-stopped',
+      '-p', '80:80',
+      '-p', '443:443',
+      '-v', "#{traefik_config}:/traefik.yml:ro",
+      '-v', "#{ROUTES_DIR}:/routes:ro",
+      '-v', "#{CERTS_DIR}:/certs:ro",
+      TRAEFIK_IMAGE,
+      '--configfile=/traefik.yml'
+    ]
+    
+    system(*cmd) or raise "Failed to start Traefik container"
+  end
+
+  def stop_traefik
+    system("docker stop #{CONTAINER_NAME} >/dev/null 2>&1")
+    system("docker rm #{CONTAINER_NAME} >/dev/null 2>&1")
+  end
+
+  def container_exists?
+    system("docker ps -a --format '{{.Names}}' | grep -q '^#{CONTAINER_NAME}$'")
+  end
+
+  def container_running?
+    system("docker ps --format '{{.Names}}' | grep -q '^#{CONTAINER_NAME}$'")
+  end
+
+  def add_app
+    app_name = File.basename(Dir.pwd)
+    app_host = "#{app_name}.localhost"
+    port = calculate_port(app_name)
+    
+    # Load registry
+    registry = load_registry
+    
+    # Check if app already exists
+    if registry[app_name]
+      puts "App '#{app_name}' is already registered"
+      puts "Host: https://#{app_host}"
+      puts "Port: #{registry[app_name]['port']}"
+      return
+    end
+    
+    # Create Traefik route configuration
+    route_file = File.join(ROUTES_DIR, "#{app_name}.yml")
+    File.write(route_file, <<~YAML)
+      http:
+        routers:
+          #{app_name}:
+            rule: "Host(`#{app_host}`)"
+            service: #{app_name}
+            tls: {}
+            entryPoints:
+              - websecure
+        
+        services:
+          #{app_name}:
+            loadBalancer:
+              servers:
+                - url: "http://host.docker.internal:#{port}"
+      
+      tls:
+        certificates:
+          - certFile: /certs/localhost.crt
+            keyFile: /certs/localhost.key
+    YAML
+    
+    # Update registry
+    registry[app_name] = {
+      'host' => app_host,
+      'port' => port,
+      'path' => Dir.pwd
+    }
+    save_registry(registry)
+    
+    puts "App '#{app_name}' registered successfully!"
+    puts "Host: https://#{app_host}"
+    puts "Port: #{port}"
+    puts ""
+    puts "Start your Rails app with:"
+    puts "  bin/rails s -p #{port}"
+    puts ""
+    puts "Or set environment variables with:"
+    puts "  eval \"$(kunado hook)\""
+    puts "  bin/rails s"
+  end
+
+  def delete_app
+    app_name = File.basename(Dir.pwd)
+    registry = load_registry
+    
+    unless registry[app_name]
+      puts "App '#{app_name}' is not registered"
+      return
+    end
+    
+    # Remove route file
+    route_file = File.join(ROUTES_DIR, "#{app_name}.yml")
+    FileUtils.rm_f(route_file)
+    
+    # Update registry
+    registry.delete(app_name)
+    save_registry(registry)
+    
+    puts "App '#{app_name}' has been removed"
+  end
+
+  def list_apps
+    registry = load_registry
+    
+    if registry.empty?
+      puts "No apps registered"
+      return
+    end
+    
+    puts "Registered apps:"
+    registry.each do |name, info|
+      status = Dir.exist?(info['path']) ? '' : ' (path not found)'
+      puts "  #{name}:"
+      puts "    Host: https://#{info['host']}"
+      puts "    Port: #{info['port']}"
+      puts "    Path: #{info['path']}#{status}"
+    end
+  end
+
+  def open_app
+    app_name = File.basename(Dir.pwd)
+    registry = load_registry
+    
+    unless registry[app_name]
+      puts "App '#{app_name}' is not registered"
+      puts "Run 'kunado add' first"
+      return
+    end
+    
+    url = "https://#{registry[app_name]['host']}"
+    
+    if RUBY_PLATFORM =~ /darwin/
+      system("open #{url}")
+    elsif RUBY_PLATFORM =~ /linux/
+      system("xdg-open #{url} 2>/dev/null || sensible-browser #{url} 2>/dev/null")
+    else
+      puts "Please open in your browser: #{url}"
+    end
+  end
+
+  def print_hook
+    app_name = File.basename(Dir.pwd)
+    registry = load_registry
+    
+    if registry[app_name]
+      puts "export APP_NAME='#{app_name}'"
+      puts "export APP_HOST='#{registry[app_name]['host']}'"
+      puts "export PORT='#{registry[app_name]['port']}'"
+    else
+      puts "# No app registered in current directory"
+      puts "# Run 'kunado add' to register this app"
+    end
+  end
+
+  def calculate_port(app_name)
+    # Hash app name to get consistent port
+    hash = Digest::SHA256.hexdigest(app_name)
+    # Convert first 8 chars of hash to number and map to port range 3000-8999
+    base = hash[0..7].to_i(16)
+    3000 + (base % 6000)
+  end
+
+  def load_registry
+    JSON.parse(File.read(REGISTRY_FILE))
+  rescue
+    {}
+  end
+
+  def save_registry(registry)
+    File.write(REGISTRY_FILE, JSON.pretty_generate(registry))
+  end
+
+  def print_help
+    puts <<~HELP
+      kunado - Rails development gateway
+      
+      USAGE:
+        kunado <command> [options]
+      
+      COMMANDS:
+        proxy up      Start the proxy server
+        proxy down    Stop the proxy server
+        proxy status  Show proxy status
+        add           Register current directory as an app
+        delete        Remove current app from registry
+        list          List all registered apps
+        open          Open current app in browser
+        hook          Print environment variables for current app
+        version       Show version
+        help          Show this help
+      
+      EXAMPLES:
+        # Initial setup
+        kunado proxy up
+        echo 'eval "$(kunado hook)"' >> ~/.zshrc
+        
+        # Register and run an app
+        cd my-rails-app
+        kunado add
+        bin/rails s
+        kunado open
+    HELP
+  end
+end
+
+# Run if executed directly
+if __FILE__ == $0
+  Kunado.new.run(ARGV)
+end
