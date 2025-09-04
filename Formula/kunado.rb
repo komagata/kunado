@@ -1,8 +1,8 @@
 class Kunado < Formula
   desc "Rails development gateway for HTTPS access to multiple apps"
   homepage "https://github.com/komagata/kunado"
-  url "https://github.com/komagata/kunado/archive/v0.1.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256"
+  url "https://github.com/komagata/kunado/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "c4a3364391a0afad3ce67fd5d65eb4fc5c50e6bb6131fd10cf40153f479fb42e"
   license "MIT"
 
   depends_on "docker"
